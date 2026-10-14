@@ -1,4 +1,4 @@
-name: Sleep & Deep Focus Odyssey
+name: 8 Soundscapes ASMR Sleep Odyssey
 
 on:
   push:
@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       seconds_per_chapter:
-        description: 'Seconds per chapter: 60 = 8 minutes; 3600 = 8 hours (10–3600, multiples of 10)'
+        description: 'Seconds per chapter: 600 = 80 minutes; 3600 = 8 hours (10–3600, multiples of 10)'
         required: true
-        default: '60'
+        default: '600'
         type: string
 
 permissions:
@@ -23,7 +23,7 @@ concurrency:
 jobs:
   render-chapters:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
     strategy:
       fail-fast: true
       max-parallel: 8
@@ -31,7 +31,7 @@ jobs:
         segment: [1, 2, 3, 4, 5, 6, 7, 8]
     env:
       SEGMENT: ${{ matrix.segment }}
-      SECONDS_PER_CHAPTER: ${{ inputs.seconds_per_chapter || '60' }}
+      SECONDS_PER_CHAPTER: ${{ inputs.seconds_per_chapter || '600' }}
       OMP_NUM_THREADS: '2'
       OPENBLAS_NUM_THREADS: '2'
     steps:
@@ -208,68 +208,111 @@ jobs:
               (out / f'report_{segment}.json').write_text(json.dumps(report, indent=2))
               print(json.dumps(report), flush=True)
 
-          def create_audio(path):
+          def create_audio(path, seconds):
               import numpy as np
-              # Original synthesized nature-like textures, not field recordings.
-              # All layers are periodic over 120s, including swell envelopes.
-              sr, length = 48000, 120
-              n = sr * length
-              rng = np.random.default_rng(2314)
-              frequency = np.fft.rfftfreq(n, 1 / sr)
-              t = np.arange(n, dtype=np.float64) / sr
-
-              def colored(exponent, low, high):
-                  shaping = np.maximum(frequency, low) ** (-exponent / 2)
-                  shaping *= np.exp(-(frequency / high) ** 4)
-                  shaping *= 1 - np.exp(-(frequency / low) ** 4)
-                  spectrum = (rng.normal(size=len(frequency))
-                              + 1j * rng.normal(size=len(frequency))) * shaping
-                  spectrum[0] = spectrum[-1] = 0
-                  signal = np.fft.irfft(spectrum, n=n)
-                  signal /= max(float(np.std(signal)), 1e-9)
-                  return signal.astype(np.float32)
-
-              # Shared components preserve a full sound when played in mono on phones.
-              warm = colored(1.8, 65, 900)
-              surf = colored(1.0, 140, 2600)
-              rain = colored(0.2, 450, 4200)
-              swell = (0.5 + 0.5 * np.sin(2 * np.pi * t / 12)) ** 2
-              swell = (0.25 + 0.75 * swell) * (
-                  0.90 + 0.10 * np.cos(2 * np.pi * t / 40))
-              rainfall = 0.90 + 0.10 * np.sin(2 * np.pi * t / 30)
-              common = (0.022 * warm + 0.050 * surf * swell
-                        + 0.022 * rain * rainfall)
-              stereo = np.empty((n, 2), dtype=np.float32)
-              for channel in range(2):
-                  side = colored(0.8, 250, 3500)
-                  stereo[:, channel] = common + 0.009 * side
-
-              # Rounded water-like ticks: slow attacks, soft tails, no sharp clicks.
-              for _ in range(360):
-                  span = int(rng.uniform(0.06, 0.16) * sr)
-                  tt = np.arange(span) / sr
-                  pitch = rng.uniform(550, 1300)
-                  envelope = np.sin(np.pi * np.arange(span) / span) ** 2
-                  envelope *= np.exp(-tt * 22)
-                  drop = np.sin(2 * np.pi * (pitch * tt - 650 * tt * tt))
-                  drop *= envelope * rng.uniform(0.008, 0.020)
-                  start = int(rng.integers(0, n))
-                  indices = (start + np.arange(span)) % n
-                  pan = rng.uniform(0.25, 0.75)
-                  stereo[indices, 0] += drop * np.sqrt(1 - pan)
-                  stereo[indices, 1] += drop * np.sqrt(pan)
-
-              # Target roughly -24 dBFS RMS; peak ceiling leaves ample AAC headroom.
-              rms = float(np.sqrt(np.mean(stereo.astype(np.float64) ** 2)))
-              gain = min(0.063 / max(rms, 1e-9),
-                         0.45 / max(float(np.max(np.abs(stereo))), 1e-9))
-              stereo *= gain
-              pcm = np.round(stereo * 32767).astype('<i2')
-              with wave.open(str(path), 'wb') as wav:
+              from scipy.signal import butter, sosfilt
+              sr = 48000
+              rng = np.random.default_rng(20261015)
+              chunk = sr * 5
+              names = ['Rain on Glass', 'Lo-Fi Piano and Vinyl', 'Forest Stream',
+                       'Fireplace Crackles', 'Moonlit Ocean', 'Singing Bowls and Water',
+                       'Deep Space Drone', 'Deep Sleep Pink Noise']
+              total = seconds * 8
+              filters = {}
+              def filtered(x, key, lo=None, hi=None):
+                  if key not in filters:
+                      if lo and hi:
+                          sos = butter(2, [lo, hi], btype='bandpass', fs=sr, output='sos')
+                      else:
+                          sos = butter(2, hi or lo, btype='lowpass' if hi else 'highpass',
+                                       fs=sr, output='sos')
+                      filters[key] = [sos, np.zeros((sos.shape[0], 2))]
+                  sos, zi = filters[key]
+                  y, zf = sosfilt(sos, x, axis=0, zi=zi)
+                  filters[key][1] = zf
+                  return y
+              def synth(kind, t, noise, left, right):
+                  n = len(t)
+                  mid = noise.mean(axis=1)
+                  slow = 0.65 + 0.35 * np.sin(2*np.pi*t/13)**2
+                  if kind == 0:
+                      base = 0.070*filtered(noise, 'rain', 250, 6500)
+                      drops = (np.sin(2*np.pi*(t*2.7+0.15*np.sin(t*0.6)))**34)
+                      base += (0.018*drops)[:,None]*filtered(noise,'glass',900,7000)
+                      base += (0.012*np.sin(2*np.pi*43*t)*np.sin(2*np.pi*t/39)**18)[:,None]
+                  elif kind == 1:
+                      crackle = filtered(noise,'vinyl',1500,9500)
+                      base = 0.012*crackle
+                      chords = [(220,261.63,329.63),(196,246.94,293.66),(174.61,220,261.63),(164.81,196,246.94)]
+                      piano = np.zeros(n)
+                      for j, chord in enumerate(chords):
+                          phase = (t-j*12)%48
+                          env = np.exp(-np.mod(phase,12)/3.5)*(np.mod(phase,12)<10)
+                          for freq in chord:
+                              piano += 0.007*env*(np.sin(2*np.pi*freq*t)+0.18*np.sin(2*np.pi*2*freq*t))
+                      base += piano[:,None]
+                  elif kind == 2:
+                      stream = filtered(noise,'stream',280,4200)
+                      leaves = filtered(noise,'leaves',100,1400)
+                      base = 0.055*stream + 0.015*leaves*slow[:,None]
+                      chirp = (np.sin(2*np.pi*t/17)**40)*np.sin(2*np.pi*(1150*t+70*np.sin(t*4)))
+                      base += (0.005*chirp)[:,None]
+                  elif kind == 3:
+                      rumble = filtered(noise,'firelow',40,480)
+                      snaps = filtered(noise,'firehigh',1100,9000)
+                      impulses = (np.sin(2*np.pi*t*1.73)**100 + np.sin(2*np.pi*t*2.37)**120)
+                      base = 0.042*rumble + 0.035*impulses[:,None]*snaps
+                  elif kind == 4:
+                      surf = filtered(noise,'surf',90,2800)
+                      wash = (0.12 + 0.88*(0.5+0.5*np.sin(2*np.pi*t/11))**2)
+                      base = 0.075*surf*wash[:,None]
+                      base += (0.006*np.sin(2*np.pi*62*t)*wash)[:,None]
+                  elif kind == 5:
+                      water = filtered(noise,'water',400,4500)
+                      taps = np.sin(2*np.pi*t/5.3)**90
+                      base = 0.025*water + (0.011*taps)[:,None]*water
+                      bowl = np.zeros(n)
+                      for freq in (216,324,432):
+                          env = np.exp(-np.mod(t,18)/6)
+                          bowl += 0.008*env*np.sin(2*np.pi*freq*t)
+                      base += bowl[:,None]
+                  elif kind == 6:
+                      brown = filtered(noise,'brown',30,450)
+                      drone = 0.015*np.sin(2*np.pi*55*t)+0.008*np.sin(2*np.pi*82.4*t)
+                      pad = 0.006*np.sin(2*np.pi*132*t)*slow
+                      base = 0.060*brown + (drone+pad)[:,None]
+                  else:
+                      pink = filtered(noise,'pink',70,1200)
+                      binaural = np.column_stack((0.008*np.sin(2*np.pi*108*t),
+                                                  0.008*np.sin(2*np.pi*110*t)))
+                      base = 0.060*pink + binaural
+                  if base.shape[1] == 1:
+                      base = np.repeat(base,2,axis=1)
+                  return base
+              with wave.open(str(path),'wb') as wav:
                   wav.setnchannels(2)
                   wav.setsampwidth(2)
                   wav.setframerate(sr)
-                  wav.writeframes(pcm.tobytes())
+                  for offset in range(0,total*sr,chunk):
+                      count = min(chunk,total*sr-offset)
+                      t = (offset+np.arange(count,dtype=np.float64))/sr
+                      noise = rng.standard_normal((count,2)).astype(np.float64)
+                      chapter = min(7,int(t[0]//seconds))
+                      a = synth(chapter,t,noise,None,None)
+                      # 3-second smooth transitions between chapter soundscapes.
+                      boundary = (chapter+1)*seconds
+                      blend = np.clip((t-(boundary-3))/3,0,1)
+                      if chapter < 7 and np.any(blend>0):
+                          b = synth(chapter+1,t,noise,None,None)
+                          w = blend*blend*(3-2*blend)
+                          a = a*(1-w[:,None])+b*w[:,None]
+                      # Comfortable headroom; no loud surprises or clipping.
+                      a = np.tanh(a*1.3)*0.72
+                      fade = np.minimum(1,np.minimum(t/4,(total-t)/4))
+                      a *= np.maximum(0,fade)[:,None]
+                      pcm = np.round(np.clip(a,-0.707,0.707)*32767).astype('<i2')
+                      wav.writeframes(pcm.tobytes())
+                  print('Created 8 unique stereo soundscapes:', ', '.join(names),flush=True)
 
           def assemble(seconds):
               reports = []
@@ -287,22 +330,22 @@ jobs:
                   metadata += (f'[CHAPTER]\nTIMEBASE=1/1000\nSTART={i*seconds*1000}\n'
                                f'END={(i+1)*seconds*1000}\ntitle={title}\n')
               Path('chapters.ffmeta').write_text(metadata)
-              create_audio('ambience.wav')
+              create_audio('ambience.wav', seconds)
               Path('final').mkdir(exist_ok=True)
-              output = Path('final/Sleep_Deep_Focus_Odyssey.mp4')
+              output = Path('final/ASMR_Sleep_Odyssey_Full.mp4')
               run(['ffmpeg', '-hide_banner', '-loglevel', 'warning', '-y',
                    '-f', 'concat', '-safe', '0', '-i', 'concat.txt',
-                   '-stream_loop', '-1', '-i', 'ambience.wav',
+                   '-i', 'ambience.wav',
                    '-f', 'ffmetadata', '-i', 'chapters.ffmeta',
                    '-map', '0:v:0', '-map', '1:a:0', '-map_metadata', '2',
-                   '-map_chapters', '2', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '160k',
+                   '-map_chapters', '2', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '256k',
                    '-af', f'afade=t=in:st=0:d=8,afade=t=out:st={total-8}:d=8',
                    '-t', total, '-movflags', '+faststart', output])
               validate(output, total, audio=True)
               # Chapters use gentle motion but intentional scene cuts. Audio is
               # continuous across those cuts; video crossfades are not claimed.
               summary = {'total_seconds': total, 'resolution': '1920x1080',
-                         'fps': FPS, 'audio': 'layered synthesized rain, surf swells, warm bed, soft water ticks; stereo',
+                         'fps': FPS, 'audio': '8 distinct synthesized stereo soundscapes: rain, piano, forest, fire, ocean, bowls, space, pink noise',
                          'chapters': reports, 'output_bytes': output.stat().st_size}
               Path('final/render_report.json').write_text(json.dumps(summary, indent=2))
               chapter_lines = []
@@ -345,9 +388,9 @@ jobs:
   assemble:
     needs: render-chapters
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
     env:
-      SECONDS_PER_CHAPTER: ${{ inputs.seconds_per_chapter || '60' }}
+      SECONDS_PER_CHAPTER: ${{ inputs.seconds_per_chapter || '600' }}
       OPENBLAS_NUM_THREADS: '2'
     steps:
       - name: Set up Python
@@ -358,7 +401,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg
-          python -m pip install --disable-pip-version-check numpy==2.2.6
+          python -m pip install --disable-pip-version-check numpy==2.2.6 scipy==1.15.3
       - name: Download all eight chapters and embedded engine
         uses: actions/download-artifact@v4
         with:
