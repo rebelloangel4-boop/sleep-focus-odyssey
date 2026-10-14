@@ -226,7 +226,7 @@ jobs:
                       else:
                           sos = butter(2, hi or lo, btype='lowpass' if hi else 'highpass',
                                        fs=sr, output='sos')
-                      filters[key] = [sos, np.zeros((sos.shape[0], 2))]
+                      filters[key] = [sos, np.zeros((sos.shape[0], 2, 2))]
                   sos, zi = filters[key]
                   y, zf = sosfilt(sos, x, axis=0, zi=zi)
                   filters[key][1] = zf
