@@ -209,23 +209,61 @@ jobs:
 
           def create_audio(path):
               import numpy as np
-              # A periodic, filtered noise bed. No speech, copyrighted tracks,
-              # sharp transients, or medically claimed binaural effects.
-              sr, length = 48000, 60
+              # Original synthesized nature-like textures, not field recordings.
+              # All layers are periodic over 120s, including swell envelopes.
+              sr, length = 48000, 120
               n = sr * length
-              rng = np.random.default_rng(2307)
+              rng = np.random.default_rng(2314)
               frequency = np.fft.rfftfreq(n, 1 / sr)
-              shaping = (1 / np.maximum(frequency, 35)**0.85
-                         * np.exp(-(frequency / 1300)**2))
-              shaping[frequency < 25] = 0
-              channels = []
-              for _ in range(2):
+              t = np.arange(n, dtype=np.float64) / sr
+
+              def colored(exponent, low, high):
+                  shaping = np.maximum(frequency, low) ** (-exponent / 2)
+                  shaping *= np.exp(-(frequency / high) ** 4)
+                  shaping *= 1 - np.exp(-(frequency / low) ** 4)
                   spectrum = (rng.normal(size=len(frequency))
                               + 1j * rng.normal(size=len(frequency))) * shaping
-                  noise = np.fft.irfft(spectrum, n=n)
-                  noise /= max(float(np.max(np.abs(noise))), 1e-9)
-                  channels.append(noise * 0.10)
-              pcm = (np.column_stack(channels) * 32767).astype('<i2')
+                  spectrum[0] = spectrum[-1] = 0
+                  signal = np.fft.irfft(spectrum, n=n)
+                  signal /= max(float(np.std(signal)), 1e-9)
+                  return signal.astype(np.float32)
+
+              # Shared components preserve a full sound when played in mono on phones.
+              warm = colored(1.8, 65, 900)
+              surf = colored(1.0, 140, 2600)
+              rain = colored(0.2, 450, 4200)
+              swell = (0.5 + 0.5 * np.sin(2 * np.pi * t / 12)) ** 2
+              swell = (0.25 + 0.75 * swell) * (
+                  0.90 + 0.10 * np.cos(2 * np.pi * t / 40))
+              rainfall = 0.90 + 0.10 * np.sin(2 * np.pi * t / 30)
+              common = (0.022 * warm + 0.050 * surf * swell
+                        + 0.022 * rain * rainfall)
+              stereo = np.empty((n, 2), dtype=np.float32)
+              for channel in range(2):
+                  side = colored(0.8, 250, 3500)
+                  stereo[:, channel] = common + 0.009 * side
+
+              # Rounded water-like ticks: slow attacks, soft tails, no sharp clicks.
+              for _ in range(360):
+                  span = int(rng.uniform(0.06, 0.16) * sr)
+                  tt = np.arange(span) / sr
+                  pitch = rng.uniform(550, 1300)
+                  envelope = np.sin(np.pi * np.arange(span) / span) ** 2
+                  envelope *= np.exp(-tt * 22)
+                  drop = np.sin(2 * np.pi * (pitch * tt - 650 * tt * tt))
+                  drop *= envelope * rng.uniform(0.008, 0.020)
+                  start = int(rng.integers(0, n))
+                  indices = (start + np.arange(span)) % n
+                  pan = rng.uniform(0.25, 0.75)
+                  stereo[indices, 0] += drop * np.sqrt(1 - pan)
+                  stereo[indices, 1] += drop * np.sqrt(pan)
+
+              # Target roughly -24 dBFS RMS; peak ceiling leaves ample AAC headroom.
+              rms = float(np.sqrt(np.mean(stereo.astype(np.float64) ** 2)))
+              gain = min(0.063 / max(rms, 1e-9),
+                         0.45 / max(float(np.max(np.abs(stereo))), 1e-9))
+              stereo *= gain
+              pcm = np.round(stereo * 32767).astype('<i2')
               with wave.open(str(path), 'wb') as wav:
                   wav.setnchannels(2)
                   wav.setsampwidth(2)
@@ -256,14 +294,14 @@ jobs:
                    '-stream_loop', '-1', '-i', 'ambience.wav',
                    '-f', 'ffmetadata', '-i', 'chapters.ffmeta',
                    '-map', '0:v:0', '-map', '1:a:0', '-map_metadata', '2',
-                   '-map_chapters', '2', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '96k',
-                   '-af', f'afade=t=in:st=0:d=5,afade=t=out:st={total-5}:d=5',
+                   '-map_chapters', '2', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '160k',
+                   '-af', f'afade=t=in:st=0:d=8,afade=t=out:st={total-8}:d=8',
                    '-t', total, '-movflags', '+faststart', output])
               validate(output, total, audio=True)
               # Chapters use gentle motion but intentional scene cuts. Audio is
               # continuous across those cuts; video crossfades are not claimed.
               summary = {'total_seconds': total, 'resolution': '1920x1080',
-                         'fps': FPS, 'audio': 'procedural filtered noise, stereo',
+                         'fps': FPS, 'audio': 'layered synthesized rain, surf swells, warm bed, soft water ticks; stereo',
                          'chapters': reports, 'output_bytes': output.stat().st_size}
               Path('final/render_report.json').write_text(json.dumps(summary, indent=2))
               chapter_lines = []
@@ -336,3 +374,4 @@ jobs:
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
+
