@@ -1,0 +1,93 @@
+name: RIFTVERSE Audio Engine V1
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Duration in minutes (1-80)"
+        required: true
+        default: "10"
+permissions:
+  contents: read
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install numpy==2.2.6 scipy==1.15.3 soundfile==0.13.1
+      - name: Synthesize and master original stereo ambience
+        env:
+          MINUTES: ${{ inputs.minutes }}
+        run: |
+          cat > /tmp/rift_audio.py <<'PY'
+          import os, math
+          import numpy as np
+          import soundfile as sf
+          from scipy.signal import butter, sosfilt
+          rng=np.random.default_rng(8721)
+          sr=48000
+          mins=max(1,min(80,int(os.getenv("MINUTES","10"))))
+          total=mins*60
+          os.makedirs("output",exist_ok=True)
+          sos_rain=butter(3,[140,4800],btype="bandpass",fs=sr,output="sos")
+          sos_wind=butter(2,240,btype="lowpass",fs=sr,output="sos")
+          rain_state=np.zeros((sos_rain.shape[0],2,2))
+          wind_state=np.zeros((sos_wind.shape[0],2,2))
+          # 10-second blocks, stateful filtering and continuous phase.
+          with sf.SoundFile("output/RIFTVERSE_10min_audio_master.wav",mode="w",samplerate=sr,channels=2,subtype="PCM_24") as out:
+            for start in range(0,total*sr,10*sr):
+              n=min(10*sr,total*sr-start)
+              t=(start+np.arange(n,dtype=np.float64))/sr
+              raw=rng.standard_normal((n,2)).astype(np.float32)
+              rain,rain_state=sosfilt(sos_rain,raw,axis=0,zi=rain_state)
+              wind,wind_state=sosfilt(sos_wind,raw,axis=0,zi=wind_state)
+              breath=(0.68+0.18*np.sin(2*np.pi*0.015*t))[:,None]
+              rain=rain*breath*0.085
+              wind=wind*(0.035+0.012*np.sin(2*np.pi*0.009*t))[:,None]
+              # Warm harmonic pad with slow left-right spatial movement.
+              pad=np.zeros(n)
+              for f,a in [(110,.014),(164.81,.010),(220,.006),(329.63,.003)]:
+                pad+=a*np.sin(2*np.pi*f*t+0.08*np.sin(2*np.pi*.012*t))
+              pan=np.sin(2*np.pi*.004*t)
+              stereo_pad=np.column_stack((pad*(.84+.16*pan),pad*(.84-.16*pan)))
+              # Occasional quiet droplet accents, softly decaying and low-pass shaped.
+              droplets=np.zeros((n,2),dtype=np.float32)
+              first=int(math.ceil((start/sr)/3.7))
+              last=int(math.ceil(((start+n)/sr)/3.7))
+              for k in range(first,last):
+                onset=k*3.7+0.4*np.sin(k*1.7)
+                ix=int(round(onset*sr))-start
+                if 0<=ix<n:
+                  length=min(int(.11*sr),n-ix)
+                  q=np.arange(length)/sr
+                  d=.012*np.exp(-45*q)*np.sin(2*np.pi*(780+180*np.sin(k))*q)
+                  droplets[ix:ix+length,k%2]+=d.astype(np.float32)
+              mix=rain+wind+stereo_pad+droplets
+              fade=np.minimum(1,np.minimum(t/5,(total-t)/5))
+              mix*=fade[:,None]
+              mix=np.tanh(mix*1.4)*.75
+              out.write(mix.astype(np.float32))
+          print("Rendered",total,"seconds; 48 kHz stereo 24-bit PCM WAV")
+          PY
+          python /tmp/rift_audio.py
+      - name: Inspect master
+        run: |
+          python - <<'PY'
+          import soundfile as sf,numpy as np
+          p="output/RIFTVERSE_10min_audio_master.wav"
+          with sf.SoundFile(p) as f:
+            assert f.samplerate==48000 and f.channels==2
+            peak=0
+            for block in f.blocks(blocksize=480000):
+              peak=max(peak,float(np.max(np.abs(block))))
+            assert peak<0.99,peak
+            print("Duration:",len(f)/f.samplerate,"seconds; peak:",peak)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RIFTVERSE-Audio-Master
+          path: output/*.wav
+          retention-days: 7
