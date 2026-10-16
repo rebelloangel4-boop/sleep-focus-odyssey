@@ -1,0 +1,435 @@
+name: RIFTVERSE Scene Matched ASMR Test
+
+on:
+  push:
+    paths:
+      - '.github/workflows/riftverse-scenes.yml'
+  workflow_dispatch:
+    inputs:
+      seconds_per_chapter:
+        description: 'Seconds per chapter: 600 = 80 minutes; 3600 = 8 hours (10–3600, multiples of 10)'
+        required: true
+        default: '10'
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: odyssey-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  render-chapters:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: true
+      max-parallel: 8
+      matrix:
+        segment: [1, 2, 3, 4, 5, 6, 7, 8]
+    env:
+      SEGMENT: ${{ matrix.segment }}
+      SECONDS_PER_CHAPTER: ${{ inputs.seconds_per_chapter || '10' }}
+      OMP_NUM_THREADS: '2'
+      OPENBLAS_NUM_THREADS: '2'
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core
+          python -m pip install --disable-pip-version-check requests==2.32.3 numpy==2.2.6 opencv-python-headless==4.11.0.86 Pillow==11.2.1
+      - name: Write the complete engine
+        shell: bash
+        run: |
+          cat << 'EOF' > run_engine.py
+          import io
+          import json
+          import math
+          import os
+          import subprocess
+          import sys
+          import time
+          import wave
+          from pathlib import Path
+          from urllib.parse import quote
+
+          W, H, FPS, LOOP = 1920, 1080, 30, 10
+          TITLES = [
+              'Rain on Window', 'Midnight Lo-Fi', 'Forest Stream',
+              'Fireplace Crackles', 'Moonlit Ocean', 'Zen Garden Bowls',
+              'Deep Space Drone', 'Deep Sleep Stillness',
+          ]
+          SCENES = [
+              'rain drops streaming down a cozy bedroom window at night, warm lamp indoors, wet street outside',
+              'cozy midnight lofi piano desk beside rainy city window, amber reading lamp, no people',
+              'clear forest stream flowing over mossy rocks beneath ancient trees',
+              'close up glowing fireplace with orange flames and embers in cozy wooden cabin',
+              'moonlit ocean beach with gentle waves and silver reflections at night',
+              'Japanese zen garden with water fountain, singing bowls and warm lanterns',
+              'vast dreamy deep space nebula with subtle violet blue stars and cosmic haze',
+              'dark snowy cabin under faint aurora and stars, quiet blue night',
+          ]
+
+          def run(args):
+              print('+', ' '.join(map(str, args)), flush=True)
+              subprocess.run(list(map(str, args)), check=True)
+
+          def duration_input():
+              raw = os.environ.get('SECONDS_PER_CHAPTER', '60')
+              if not raw.isascii() or not raw.isdecimal():
+                  raise ValueError('seconds_per_chapter must be an integer')
+              n = int(raw)
+              if not 10 <= n <= 3600 or n % LOOP:
+                  raise ValueError('Use a multiple of 10 from 10 through 3600')
+              return n
+
+          def probe(path):
+              return json.loads(subprocess.check_output([
+                  'ffprobe', '-v', 'error', '-show_format', '-show_streams',
+                  '-of', 'json', str(path),
+              ]))
+
+          def validate(path, seconds, audio=False):
+              data = probe(path)
+              video = next(s for s in data['streams'] if s['codec_type'] == 'video')
+              assert (video['width'], video['height']) == (W, H), data
+              assert video['codec_name'] == 'h264', data
+              assert video['pix_fmt'] == 'yuv420p', data
+              assert video['r_frame_rate'] == '30/1', data
+              assert abs(float(data['format']['duration']) - seconds) < 0.15, data
+              assert int(video['nb_frames']) == seconds * FPS, data
+              if audio:
+                  sound = next(s for s in data['streams'] if s['codec_type'] == 'audio')
+                  assert sound['codec_name'] == 'aac' and sound['channels'] == 2, data
+              # Decode the beginning and end to catch broken muxing without
+              # spending eight hours decoding an eight-hour output.
+              for start in (0, max(0, seconds - 1)):
+                  run(['ffmpeg', '-v', 'error', '-xerror', '-ss', start,
+                       '-i', path, '-t', '1', '-f', 'null', '-'])
+
+          def get_image(segment):
+              import numpy as np
+              import requests
+              from PIL import Image, ImageOps
+              prompt = (SCENES[segment - 1] + ', cinematic wide landscape, dark serene '
+                        'sleep atmosphere, photorealistic, no people, no text, no logos')
+              seed = 81700 + segment
+              url = ('https://image.pollinations.ai/prompt/' + quote(prompt, safe='')
+                     + f'?width={W}&height={H}&model=flux&nologo=true&seed={seed}')
+              if os.environ.get('ODYSSEY_OFFLINE') != '1':
+                  for attempt in range(3):
+                      try:
+                          # Bound both request time and image download size.
+                          started = time.monotonic()
+                          with requests.get(url, timeout=(10, 35), stream=True) as r:
+                              r.raise_for_status()
+                              payload = bytearray()
+                              for chunk in r.iter_content(65536):
+                                  payload.extend(chunk)
+                                  if len(payload) > 20_000_000 or time.monotonic() - started > 60:
+                                      raise ValueError('Image download limit exceeded')
+                          with Image.open(io.BytesIO(payload)) as im:
+                              im = ImageOps.fit(im.convert('RGB'), (W, H),
+                                                method=Image.Resampling.LANCZOS)
+                              return np.asarray(im).copy(), 'pollinations'
+                      except Exception as exc:
+                          print(f'Image attempt {attempt + 1}/3 failed: {exc}', flush=True)
+                          if attempt < 2:
+                              time.sleep(3 * (attempt + 1))
+              # Deterministic, chapter-specific dark gradient; no paid API.
+              y, x = np.mgrid[0:H, 0:W].astype(np.float32)
+              x, y = x / W, y / H
+              glow = np.exp(-((x - 0.3 - segment * 0.04)**2 / 0.18
+                              + (y - 0.48)**2 / 0.12))
+              colors = [(24, 42, 70), (16, 52, 43), (28, 34, 65), (45, 31, 65),
+                        (18, 48, 58), (25, 29, 62), (34, 23, 55), (14, 21, 36)]
+              base = np.array(colors[segment - 1], dtype=np.float32)
+              pixels = (0.25 + glow[..., None] * 0.75) * base
+              return np.uint8(np.clip(pixels, 0, 255)), 'procedural-fallback'
+
+          def render(segment, seconds):
+              import cv2
+              import numpy as np
+              from PIL import Image
+              cv2.setNumThreads(2)
+              out = Path('out')
+              out.mkdir(exist_ok=True)
+              rgb, source = get_image(segment)
+              dim = 0.85 - (segment - 1) * (0.40 / 7)
+              rgb = np.uint8(np.clip(rgb.astype(np.float32) * dim, 0, 255))
+              Image.fromarray(rgb).save(out / f'preview_{segment}.jpg')
+              bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+              loop = Path(f'loop_{segment}.mp4')
+              # OpenCV generates every motion frame; FFmpeg encodes the raw pipe
+              # because pip OpenCV wheels do not reliably include an H.264 encoder.
+              command = [
+                  'ffmpeg', '-hide_banner', '-loglevel', 'warning', '-y',
+                  '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-s', f'{W}x{H}',
+                  '-r', str(FPS), '-i', 'pipe:0', '-an', '-c:v', 'libx264',
+                  '-preset', 'veryfast', '-crf', '26', '-maxrate', '1200k',
+                  '-bufsize', '2400k', '-pix_fmt', 'yuv420p', '-threads', '2',
+                  '-g', '60', '-keyint_min', '60', '-sc_threshold', '0',
+                  '-bf', '0', '-video_track_timescale', '90000', str(loop),
+              ]
+              proc = subprocess.Popen(command, stdin=subprocess.PIPE)
+              try:
+                  for frame in range(LOOP * FPS):
+                      # Periodic position AND velocity: no duplicated end frame.
+                      phase = 2 * math.pi * frame / (LOOP * FPS)
+                      scale = 1.035 + 0.004 * math.sin(phase)
+                      matrix = cv2.getRotationMatrix2D((W / 2, H / 2), 0, scale)
+                      matrix[0, 2] += 5 * math.sin(phase)
+                      matrix[1, 2] += 3 * math.cos(phase)
+                      image = cv2.warpAffine(bgr, matrix, (W, H),
+                                             flags=cv2.INTER_LINEAR,
+                                             borderMode=cv2.BORDER_REFLECT_101)
+                      proc.stdin.write(image.tobytes())
+              finally:
+                  proc.stdin.close()
+                  status = proc.wait()
+              if status:
+                  raise RuntimeError(f'Loop encoder failed with status {status}')
+              validate(loop, LOOP)
+              # Repeat encoded packets, not the expensive image transforms.
+              chapter = out / f'chapter_{segment}.mp4'
+              run(['ffmpeg', '-v', 'warning', '-y', '-stream_loop', '-1',
+                   '-i', loop, '-t', seconds, '-map', '0:v:0', '-c:v', 'copy',
+                   '-an', '-movflags', '+faststart', chapter])
+              validate(chapter, seconds)
+              report = {'chapter': segment, 'title': TITLES[segment - 1],
+                        'seconds': seconds, 'dim': round(dim, 6), 'image_source': source,
+                        'bytes': chapter.stat().st_size}
+              (out / f'report_{segment}.json').write_text(json.dumps(report, indent=2))
+              print(json.dumps(report), flush=True)
+
+          def create_audio(path, seconds):
+              import numpy as np
+              from scipy.signal import butter, sosfilt
+              sr = 48000
+              rng = np.random.default_rng(20261015)
+              chunk = sr * 5
+              names = ['Rain on Glass', 'Lo-Fi Piano and Vinyl', 'Forest Stream',
+                       'Fireplace Crackles', 'Moonlit Ocean', 'Singing Bowls and Water',
+                       'Deep Space Drone', 'Deep Sleep Pink Noise']
+              total = seconds * 8
+              filters = {}
+              def filtered(x, key, lo=None, hi=None):
+                  if key not in filters:
+                      if lo and hi:
+                          sos = butter(2, [lo, hi], btype='bandpass', fs=sr, output='sos')
+                      else:
+                          sos = butter(2, hi or lo, btype='lowpass' if hi else 'highpass',
+                                       fs=sr, output='sos')
+                      filters[key] = [sos, np.zeros((sos.shape[0], 2, 2))]
+                  sos, zi = filters[key]
+                  y, zf = sosfilt(sos, x, axis=0, zi=zi)
+                  filters[key][1] = zf
+                  return y
+              def synth(kind, t, noise, left, right):
+                  n = len(t)
+                  mid = noise.mean(axis=1)
+                  slow = 0.65 + 0.35 * np.sin(2*np.pi*t/13)**2
+                  if kind == 0:
+                      base = 0.070*filtered(noise, 'rain', 250, 6500)
+                      drops = (np.sin(2*np.pi*(t*2.7+0.15*np.sin(t*0.6)))**34)
+                      base += (0.018*drops)[:,None]*filtered(noise,'glass',900,7000)
+                      base += (0.012*np.sin(2*np.pi*43*t)*np.sin(2*np.pi*t/39)**18)[:,None]
+                  elif kind == 1:
+                      crackle = filtered(noise,'vinyl',1500,9500)
+                      base = 0.012*crackle
+                      chords = [(220,261.63,329.63),(196,246.94,293.66),(174.61,220,261.63),(164.81,196,246.94)]
+                      piano = np.zeros(n)
+                      for j, chord in enumerate(chords):
+                          phase = (t-j*12)%48
+                          env = np.exp(-np.mod(phase,12)/3.5)*(np.mod(phase,12)<10)
+                          for freq in chord:
+                              piano += 0.007*env*(np.sin(2*np.pi*freq*t)+0.18*np.sin(2*np.pi*2*freq*t))
+                      base += piano[:,None]
+                  elif kind == 2:
+                      stream = filtered(noise,'stream',280,4200)
+                      leaves = filtered(noise,'leaves',100,1400)
+                      base = 0.055*stream + 0.015*leaves*slow[:,None]
+                      chirp = (np.sin(2*np.pi*t/17)**40)*np.sin(2*np.pi*(1150*t+70*np.sin(t*4)))
+                      base += (0.005*chirp)[:,None]
+                  elif kind == 3:
+                      rumble = filtered(noise,'firelow',40,480)
+                      snaps = filtered(noise,'firehigh',1100,9000)
+                      impulses = (np.sin(2*np.pi*t*1.73)**100 + np.sin(2*np.pi*t*2.37)**120)
+                      base = 0.042*rumble + 0.035*impulses[:,None]*snaps
+                  elif kind == 4:
+                      surf = filtered(noise,'surf',90,2800)
+                      wash = (0.12 + 0.88*(0.5+0.5*np.sin(2*np.pi*t/11))**2)
+                      base = 0.075*surf*wash[:,None]
+                      base += (0.006*np.sin(2*np.pi*62*t)*wash)[:,None]
+                  elif kind == 5:
+                      water = filtered(noise,'water',400,4500)
+                      taps = np.sin(2*np.pi*t/5.3)**90
+                      base = 0.025*water + (0.011*taps)[:,None]*water
+                      bowl = np.zeros(n)
+                      for freq in (216,324,432):
+                          env = np.exp(-np.mod(t,18)/6)
+                          bowl += 0.008*env*np.sin(2*np.pi*freq*t)
+                      base += bowl[:,None]
+                  elif kind == 6:
+                      brown = filtered(noise,'brown',30,450)
+                      drone = 0.015*np.sin(2*np.pi*55*t)+0.008*np.sin(2*np.pi*82.4*t)
+                      pad = 0.006*np.sin(2*np.pi*132*t)*slow
+                      base = 0.060*brown + (drone+pad)[:,None]
+                  else:
+                      pink = filtered(noise,'pink',70,1200)
+                      binaural = np.column_stack((0.008*np.sin(2*np.pi*108*t),
+                                                  0.008*np.sin(2*np.pi*110*t)))
+                      base = 0.060*pink + binaural
+                  if base.shape[1] == 1:
+                      base = np.repeat(base,2,axis=1)
+                  return base
+              with wave.open(str(path),'wb') as wav:
+                  wav.setnchannels(2)
+                  wav.setsampwidth(2)
+                  wav.setframerate(sr)
+                  for offset in range(0,total*sr,chunk):
+                      count = min(chunk,total*sr-offset)
+                      t = (offset+np.arange(count,dtype=np.float64))/sr
+                      noise = rng.standard_normal((count,2)).astype(np.float64)
+                      chapter = min(7,int(t[0]//seconds))
+                      a = synth(chapter,t,noise,None,None)
+                      # 3-second smooth transitions between chapter soundscapes.
+                      boundary = (chapter+1)*seconds
+                      blend = np.clip((t-(boundary-3))/3,0,1)
+                      if chapter < 7 and np.any(blend>0):
+                          b = synth(chapter+1,t,noise,None,None)
+                          w = blend*blend*(3-2*blend)
+                          a = a*(1-w[:,None])+b*w[:,None]
+                      # Comfortable headroom; no loud surprises or clipping.
+                      a = np.tanh(a*1.3)*0.72
+                      fade = np.minimum(1,np.minimum(t/4,(total-t)/4))
+                      a *= np.maximum(0,fade)[:,None]
+                      pcm = np.round(np.clip(a,-0.707,0.707)*32767).astype('<i2')
+                      wav.writeframes(pcm.tobytes())
+                  print('Created 8 unique stereo soundscapes:', ', '.join(names),flush=True)
+
+          def assemble(seconds):
+              reports = []
+              for segment in range(1, 9):
+                  path = Path(f'out/chapter_{segment}.mp4')
+                  validate(path, seconds)
+                  report = json.loads(Path(f'out/report_{segment}.json').read_text())
+                  assert report['seconds'] == seconds and report['chapter'] == segment
+                  reports.append(report)
+              Path('concat.txt').write_text(''.join(
+                  f"file 'out/chapter_{segment}.mp4'\n" for segment in range(1, 9)))
+              total = seconds * 8
+              metadata = ';FFMETADATA1\ntitle=Sleep & Deep Focus Odyssey\n'
+              for i, title in enumerate(TITLES):
+                  metadata += (f'[CHAPTER]\nTIMEBASE=1/1000\nSTART={i*seconds*1000}\n'
+                               f'END={(i+1)*seconds*1000}\ntitle={title}\n')
+              Path('chapters.ffmeta').write_text(metadata)
+              create_audio('ambience.wav', seconds)
+              Path('final').mkdir(exist_ok=True)
+              output = Path('final/ASMR_Sleep_Odyssey_Full.mp4')
+              run(['ffmpeg', '-hide_banner', '-loglevel', 'warning', '-y',
+                   '-f', 'concat', '-safe', '0', '-i', 'concat.txt',
+                   '-i', 'ambience.wav',
+                   '-f', 'ffmetadata', '-i', 'chapters.ffmeta',
+                   '-map', '0:v:0', '-map', '1:a:0', '-map_metadata', '2',
+                   '-map_chapters', '2', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '256k',
+                   '-af', f'afade=t=in:st=0:d=8,afade=t=out:st={total-8}:d=8',
+                   '-t', total, '-movflags', '+faststart', output])
+              validate(output, total, audio=True)
+              # Chapters use gentle motion but intentional scene cuts. Audio is
+              # continuous across those cuts; video crossfades are not claimed.
+              summary = {'total_seconds': total, 'resolution': '1920x1080',
+                         'fps': FPS, 'audio': '8 distinct synthesized stereo soundscapes: rain, piano, forest, fire, ocean, bowls, space, pink noise',
+                         'chapters': reports, 'output_bytes': output.stat().st_size}
+              Path('final/render_report.json').write_text(json.dumps(summary, indent=2))
+              chapter_lines = []
+              for i, title in enumerate(TITLES):
+                  stamp = i * seconds
+                  chapter_lines.append(f'{stamp//3600:02}:{stamp//60%60:02}:{stamp%60:02} {title}')
+              Path('final/chapters.txt').write_text('\n'.join(chapter_lines) + '\n')
+              if os.environ.get('GITHUB_STEP_SUMMARY'):
+                  with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+                      f.write(f'## Odyssey ready\nDuration: {total/60:g} minutes. '
+                              f'Download the **odyssey-final** artifact.\n\n')
+                      for report in reports:
+                          f.write(f"- {report['title']}: {report['image_source']}\n")
+              print(json.dumps(summary, indent=2), flush=True)
+
+          if __name__ == '__main__':
+              seconds = duration_input()
+              if len(sys.argv) == 2 and sys.argv[1] == 'assemble':
+                  assemble(seconds)
+              else:
+                  segment = int(os.environ['SEGMENT'])
+                  if not 1 <= segment <= 8:
+                      raise ValueError('SEGMENT must be 1 through 8')
+                  render(segment, seconds)
+          EOF
+      - name: Render and verify chapter
+        run: python run_engine.py
+      - name: Include engine for assembly
+        if: matrix.segment == 1
+        run: cp run_engine.py out/run_engine.py
+      - name: Upload chapter
+        uses: actions/upload-artifact@v4
+        with:
+          name: riftverse-chapter-${{ matrix.segment }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  assemble:
+    needs: render-chapters
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      SECONDS_PER_CHAPTER: ${{ inputs.seconds_per_chapter || '600' }}
+      OPENBLAS_NUM_THREADS: '2'
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install assembly dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          python -m pip install --disable-pip-version-check numpy==2.2.6 scipy==1.15.3
+      - name: Download all eight chapters and embedded engine
+        uses: actions/download-artifact@v4
+        with:
+          pattern: riftverse-chapter-*
+          merge-multiple: true
+          path: out
+      - name: Assemble, add audio and chapter markers, verify
+        run: python out/run_engine.py assemble
+      - name: Upload single finished master
+        uses: actions/upload-artifact@v4
+        with:
+          name: RIFTVERSE-Scene-Test
+          path: final/ASMR_Sleep_Odyssey_Full.mp4
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Remove temporary chapter artifacts
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner,repo}=context.repo;
+            const run_id=context.runId;
+            const {data}=await github.rest.actions.listWorkflowRunArtifacts({owner,repo,run_id,per_page:100});
+            for(const a of data.artifacts){
+              if(a.name.startsWith('riftverse-chapter-')){
+                await github.rest.actions.deleteArtifact({owner,repo,artifact_id:a.id});
+                core.info('Deleted temporary artifact '+a.name);
+              }
+            }
